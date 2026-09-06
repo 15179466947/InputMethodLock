@@ -88,6 +88,7 @@ namespace InputMethodLock
             bool cached;
             if (_systemImeCache.TryGetValue(key, out cached)) return cached;
             bool isSystem = true;
+            string imeFile = null;
             try
             {
                 string klid = key.ToString("X8");
@@ -95,11 +96,14 @@ namespace InputMethodLock
                     @"SYSTEM\CurrentControlSet\Control\Keyboard Layouts\" + klid))
                 {
                     object v = k != null ? k.GetValue("Ime File") : null;
-                    string imeFile = v as string;
+                    imeFile = v as string;
                     if (!string.IsNullOrEmpty(imeFile))
                     {
                         isSystem = File.Exists(Path.Combine(Environment.SystemDirectory, imeFile));
                     }
+                    // Ime File 缺失时默认按系统输入法处理——此默认值存疑，记录现场便于定位
+                    Logger.Log("IsSystemIme klid={0}: ImeFile='{1}' -> system={2}",
+                        klid, imeFile ?? "(missing)", isSystem);
                 }
             }
             catch { }
@@ -180,33 +184,72 @@ namespace InputMethodLock
             return IntPtr.Zero;
         }
 
+        // 英文锁定状态变化日志：只在 (进程|布局|hIMC|开关|转换状态) 元组变化时记一条，
+        // 用于定位"锁定无效但日志全空"的静默短路分支
+        private static string _lastEngState;
+
+        private static void LogEnglishState(IntPtr hwnd, IntPtr hkl, string state, string result)
+        {
+            try
+            {
+                string klid = hkl == IntPtr.Zero ? "-" : hkl.ToInt64().ToString("X8");
+                string sig = (GetForegroundProcessName(hwnd) ?? "-") + "|" + klid + "|" + state + "|" + result;
+                if (sig == _lastEngState) return;
+                _lastEngState = sig;
+                Logger.Log("EnglishLock: proc={0} klid={1} state={2} -> {3}",
+                    GetForegroundProcessName(hwnd) ?? "-", klid, state, result);
+            }
+            catch { }
+        }
+
         // 强制前台窗口的输入法进入英文（字母数字）模式。
         // 分层策略（v0.9）：微软内置输入法尊重标准转换状态写入；
         // 搜狗等第三方输入法通常无视外部写入，改用"关闭 IME"（同 Ctrl+Space）实现英文直通
         public static bool ForceEnglishMode(IntPtr hwnd)
         {
             IntPtr hIMC = ImmGetContext(hwnd);
-            if (hIMC == IntPtr.Zero) return true; // 纯英文键盘无 IME 上下文，目标已达成
+            if (hIMC == IntPtr.Zero)
+            {
+                // 无 IME 上下文：可能是纯英文键盘，也可能是 TSF 应用/权限隔离拿不到上下文
+                LogEnglishState(hwnd, IntPtr.Zero, "no-hIMC", "treated-as-english");
+                return true;
+            }
             try
             {
-                if (!ImmGetOpenStatus(hIMC)) return true; // IME 已关闭 = 英文直通
+                bool open = ImmGetOpenStatus(hIMC);
+                if (!open)
+                {
+                    LogEnglishState(hwnd, IntPtr.Zero, "ime-closed", "english-passthrough");
+                    return true; // IME 已关闭 = 英文直通
+                }
                 int conversion = 0, sentence = 0;
-                if (!ImmGetConversionStatus(hIMC, ref conversion, ref sentence)) return true;
-                if (conversion == IME_CMODE_ALPHANUMERIC) return true; // 已是英文
+                if (!ImmGetConversionStatus(hIMC, ref conversion, ref sentence))
+                {
+                    LogEnglishState(hwnd, IntPtr.Zero, "conv-read-failed", "treated-as-english");
+                    return true;
+                }
+                if (conversion == IME_CMODE_ALPHANUMERIC)
+                {
+                    LogEnglishState(hwnd, IntPtr.Zero, "already-english", "ok");
+                    return true; // 已是英文
+                }
 
                 uint tid = GetWindowThreadProcessId(hwnd, IntPtr.Zero);
                 IntPtr hkl = GetKeyboardLayout(tid);
-                if (IsSystemIme(hkl))
+                bool sysIme = IsSystemIme(hkl);
+                bool ok;
+                if (sysIme)
                 {
-                    return ImmSetConversionStatus(hIMC, IME_CMODE_ALPHANUMERIC, sentence);
+                    ok = ImmSetConversionStatus(hIMC, IME_CMODE_ALPHANUMERIC, sentence);
+                    LogEnglishState(hwnd, hkl, "open,conv=" + conversion,
+                        "conv-write(system-ime)->" + (ok ? "ok" : "failed"));
                 }
-
-                // 第三方输入法：关闭 IME → 按键直通英文
-                bool ok = ImmSetOpenStatus(hIMC, false) && !ImmGetOpenStatus(hIMC);
-                if (ok)
+                else
                 {
-                    Logger.Log("English lock: 3rd-party IME closed for direct English (proc={0})",
-                        GetForegroundProcessName(hwnd) ?? "?");
+                    // 第三方输入法：关闭 IME → 按键直通英文
+                    ok = ImmSetOpenStatus(hIMC, false) && !ImmGetOpenStatus(hIMC);
+                    LogEnglishState(hwnd, hkl, "open,conv=" + conversion,
+                        "close-ime(3rd-party)->" + (ok ? "ok" : "failed"));
                 }
                 return ok;
             }
