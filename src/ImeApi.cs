@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
+using Microsoft.Win32;
 
 namespace InputMethodLock
 {
@@ -54,6 +57,77 @@ namespace InputMethodLock
         [DllImport("imm32.dll")]
         public static extern bool ImmSetOpenStatus(IntPtr hIMC, bool fOpen);
 
+        [DllImport("user32.dll")]
+        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        // —— SendInput 结构（Shift 模拟切换用） ——
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+
+        [StructLayout(LayoutKind.Explicit)]
+        private struct INPUTUNION { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct INPUT { public uint type; public INPUTUNION U; }
+
+        private const ushort VK_SHIFT = 0x10;
+        private const uint KEYEVENTF_KEYUP = 0x0002;
+        private const uint INPUT_KEYBOARD = 1;
+
+        // pid→判断结果缓存：前台布局的输入法是否为系统内置（微软）输入法。
+        // 依据：注册表 Keyboard Layouts\<KLID>\Ime File 是否位于 System32——
+        // 微软内置 IME 的文件都在 System32，第三方（搜狗等）在各自安装目录
+        private static readonly Dictionary<long, bool> _systemImeCache = new Dictionary<long, bool>();
+
+        public static bool IsSystemIme(IntPtr hkl)
+        {
+            long key = hkl.ToInt64();
+            bool cached;
+            if (_systemImeCache.TryGetValue(key, out cached)) return cached;
+            bool isSystem = true;
+            try
+            {
+                string klid = key.ToString("X8");
+                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(
+                    @"SYSTEM\CurrentControlSet\Control\Keyboard Layouts\" + klid))
+                {
+                    object v = k != null ? k.GetValue("Ime File") : null;
+                    string imeFile = v as string;
+                    if (!string.IsNullOrEmpty(imeFile))
+                    {
+                        isSystem = File.Exists(Path.Combine(Environment.SystemDirectory, imeFile));
+                    }
+                }
+            }
+            catch { }
+            _systemImeCache[key] = isSystem;
+            return isSystem;
+        }
+
+        // 模拟一次 Shift 按下/抬起：搜狗、微软拼音等都把 Shift 作为自带中英切换键，
+        // 当外部状态写入被无视时，让输入法"自己切"是最后的兜底（1 秒限速防抖）
+        private static int _lastShiftTick;
+
+        private static void TapShiftIfAllowed(IntPtr hwnd)
+        {
+            int now = Environment.TickCount;
+            if (now - _lastShiftTick < 1000) return;
+            _lastShiftTick = now;
+
+            INPUT[] inp = new INPUT[2];
+            inp[0].type = INPUT_KEYBOARD;
+            inp[0].U.ki.wVk = VK_SHIFT;
+            inp[1].type = INPUT_KEYBOARD;
+            inp[1].U.ki.wVk = VK_SHIFT;
+            inp[1].U.ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(2, inp, Marshal.SizeOf(typeof(INPUT)));
+            Logger.Log("IME ignored conversion write, Shift tap sent (proc={0})",
+                GetForegroundProcessName(hwnd) ?? "?");
+        }
+
         // pid → 进程名缓存：轮询 100ms + 每次按键都会触发 Enforce，
         // Process.GetProcessById 是重量级调用，绝大多数时候前台进程没变
         private static uint _cachePid;
@@ -106,17 +180,35 @@ namespace InputMethodLock
             return IntPtr.Zero;
         }
 
-        // 强制前台窗口的输入法进入英文（字母数字）模式
+        // 强制前台窗口的输入法进入英文（字母数字）模式。
+        // 分层策略（v0.9）：微软内置输入法尊重标准转换状态写入；
+        // 搜狗等第三方输入法通常无视外部写入，改用"关闭 IME"（同 Ctrl+Space）实现英文直通
         public static bool ForceEnglishMode(IntPtr hwnd)
         {
             IntPtr hIMC = ImmGetContext(hwnd);
             if (hIMC == IntPtr.Zero) return true; // 纯英文键盘无 IME 上下文，目标已达成
             try
             {
+                if (!ImmGetOpenStatus(hIMC)) return true; // IME 已关闭 = 英文直通
                 int conversion = 0, sentence = 0;
-                if (!ImmGetConversionStatus(hIMC, ref conversion, ref sentence)) return false;
+                if (!ImmGetConversionStatus(hIMC, ref conversion, ref sentence)) return true;
                 if (conversion == IME_CMODE_ALPHANUMERIC) return true; // 已是英文
-                return ImmSetConversionStatus(hIMC, IME_CMODE_ALPHANUMERIC, sentence);
+
+                uint tid = GetWindowThreadProcessId(hwnd, IntPtr.Zero);
+                IntPtr hkl = GetKeyboardLayout(tid);
+                if (IsSystemIme(hkl))
+                {
+                    return ImmSetConversionStatus(hIMC, IME_CMODE_ALPHANUMERIC, sentence);
+                }
+
+                // 第三方输入法：关闭 IME → 按键直通英文
+                bool ok = ImmSetOpenStatus(hIMC, false) && !ImmGetOpenStatus(hIMC);
+                if (ok)
+                {
+                    Logger.Log("English lock: 3rd-party IME closed for direct English (proc={0})",
+                        GetForegroundProcessName(hwnd) ?? "?");
+                }
+                return ok;
             }
             finally
             {
@@ -124,7 +216,8 @@ namespace InputMethodLock
             }
         }
 
-        // 强制前台窗口的输入法进入中文（母语）模式
+        // 强制前台窗口的输入法进入中文（母语）模式。
+        // 第三方输入法无视转换状态写入时，模拟一次 Shift 让它自己切回中文（v0.9）
         public static bool ForceNativeMode(IntPtr hwnd)
         {
             IntPtr hIMC = ImmGetContext(hwnd);
@@ -135,8 +228,20 @@ namespace InputMethodLock
                 int conversion = 0, sentence = 0;
                 if (!ImmGetConversionStatus(hIMC, ref conversion, ref sentence)) return false;
                 if ((conversion & IME_CMODE_NATIVE) != 0) return true; // 已是中文
-                conversion |= IME_CMODE_NATIVE;
-                return ImmSetConversionStatus(hIMC, conversion, sentence);
+
+                if (!ImmSetConversionStatus(hIMC, conversion | IME_CMODE_NATIVE, sentence))
+                {
+                    TapShiftIfAllowed(hwnd); // 写入直接失败
+                    return true;
+                }
+                // 写入被接受但读回仍是英文 → 输入法无视外部写入，Shift 让它自己切
+                int check = 0, sentence2 = 0;
+                if (ImmGetConversionStatus(hIMC, ref check, ref sentence2)
+                    && (check & IME_CMODE_NATIVE) == 0)
+                {
+                    TapShiftIfAllowed(hwnd);
+                }
+                return true;
             }
             finally
             {
