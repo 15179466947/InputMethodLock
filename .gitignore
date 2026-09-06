@@ -1,0 +1,29 @@
+# ===== 构建产物 =====
+bin/
+release/
+dist/
+*.exe
+*.dll
+obj/
+
+# ===== 安装包工程中间产物 =====
+packaging/*.tmp
+
+# ===== 本地运行时数据 =====
+debug.log
+*.log
+
+# ===== IDE / 编辑器 =====
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+
+# ===== ZCode 本地工作区 =====
+.zcode/
+
+# ===== 系统文件 =====
+Thumbs.db
+Desktop.ini
