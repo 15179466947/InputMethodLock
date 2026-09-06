@@ -68,6 +68,7 @@ namespace InputMethodLock
         private MenuItem _menuToggle;
         private readonly ImeWatcher _watcher = new ImeWatcher();
         private bool _hotkeyFailed; // 热键注册失败（被占用等），启动/保存后气泡提示
+        private IntPtr _userHklSnapshot; // 启用锁定时用户正在用的输入法，解锁时恢复
 
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern int GetSystemMetrics(int nIndex);
@@ -273,9 +274,30 @@ namespace InputMethodLock
         private void EnableLock()
         {
             if (_locker.Enabled) return;
+            TakeSnapshot();
             _locker.Start();
             _locker.Enforce();
             SyncLockStateUi();
+        }
+
+        // 记住用户当前输入法：解锁时自动恢复（auto 模式）；
+        // 若快照是简体中文输入法，中文锁定的兜底切换也优先用它
+        private void TakeSnapshot()
+        {
+            try
+            {
+                IntPtr hwnd = ImeApi.GetForegroundWindow();
+                if (hwnd == IntPtr.Zero) return;
+                uint tid = ImeApi.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
+                _userHklSnapshot = ImeApi.GetKeyboardLayout(tid);
+                Logger.Log("Snapshot user IME: {0}", _userHklSnapshot.ToInt64().ToString("X8"));
+                if (ImeApi.IsImeLayout(_userHklSnapshot)
+                    && (_userHklSnapshot.ToInt64() & 0xFFFF) == 0x0804)
+                {
+                    _locker.SetChineseFallbackLayout(_userHklSnapshot);
+                }
+            }
+            catch { }
         }
 
         private void DisableLock()
@@ -286,12 +308,27 @@ namespace InputMethodLock
             SyncLockStateUi();
         }
 
-        // 停用锁定时切换到用户指定的输入法（设置里配置，"无"则不动）
+        // 停用锁定时切换输入法：auto=恢复锁定前的快照；none=不动；hkl:xx=指定输入法
         private void RestoreUnlockLayout()
         {
-            IntPtr hkl = ParseLayoutStorage(_config.UnlockLayout);
+            string val = string.IsNullOrEmpty(_config.UnlockLayout) ? "auto" : _config.UnlockLayout;
+            if (val == "none") return;
+
+            IntPtr hkl;
+            if (val == "auto")
+            {
+                hkl = _userHklSnapshot;
+                if (hkl == IntPtr.Zero) return; // 没有快照（锁定期间启动的会话等）
+                Logger.Log("Unlock: restore snapshot IME {0}", hkl.ToInt64().ToString("X8"));
+            }
+            else
+            {
+                hkl = ParseLayoutStorage(val);
+                if (hkl == IntPtr.Zero) return;
+            }
+
             IntPtr hwnd = ImeApi.GetForegroundWindow();
-            if (hkl != IntPtr.Zero && hwnd != IntPtr.Zero)
+            if (hwnd != IntPtr.Zero)
                 ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, hkl);
         }
 

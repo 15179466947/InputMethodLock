@@ -13,7 +13,7 @@ namespace InputMethodLock
         public string TargetLayout = "00000409";        // 键盘布局 KLID，如 00000409 美式英文
         public string HotkeyModifiers = "Control";      // None|Alt|Control|Shift 组合（+ 号分隔）
         public string HotkeyKey = "Oemtilde";           // Keys 枚举名，None=不启用热键
-        public string UnlockLayout = "none";            // 停用锁定时切换到的键盘布局 KLID，none=不切换
+        public string UnlockLayout = "auto";            // auto=解锁恢复快照 | none=不切换 | hkl:XXXXXXXX=指定
         public List<string> Exceptions = new List<string>(); // 例外进程名（不锁定）
         public bool StartWithWindows = false;
 
@@ -57,7 +57,10 @@ namespace InputMethodLock
                         case "TargetLayout": cfg.TargetLayout = val; break;
                         case "HotkeyModifiers": cfg.HotkeyModifiers = val; break;
                         case "HotkeyKey": cfg.HotkeyKey = val; break;
-                        case "UnlockLayout": cfg.UnlockLayout = val; break;
+                        case "UnlockLayout":
+                            // v0.10 起默认 auto（恢复快照）；旧配置的 none 是默认值而非用户选择，一并升级
+                            cfg.UnlockLayout = string.IsNullOrEmpty(val) || val == "none" ? "auto" : val;
+                            break;
                         case "Exceptions": cfg.Exceptions = ParseList(val); break;
                         case "StartWithWindows": cfg.StartWithWindows = val == "true"; break;
                     }

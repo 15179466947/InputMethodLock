@@ -77,6 +77,23 @@ namespace InputMethodLock
         private const uint KEYEVENTF_KEYUP = 0x0002;
         private const uint INPUT_KEYBOARD = 1;
 
+        // 是否为输入法布局（HKL 高字 0xE000~0xEFFF，如微软拼音 E0200804、搜狗 E0xx0804）；
+        // 非输入法布局（高位=低位，如美式键盘 04090409、中文美式键盘 08040804）打字恒为英文
+        public static bool IsImeLayout(IntPtr hkl)
+        {
+            return ((hkl.ToInt64() >> 16) & 0xF000) == 0xE000;
+        }
+
+        private static IntPtr _englishHkl;
+
+        // 美式英文键盘（00000409）：TSF 应用下英文锁定的强制目标
+        public static IntPtr GetEnglishLayout()
+        {
+            if (_englishHkl == IntPtr.Zero)
+                _englishHkl = LoadKeyboardLayout("00000409", 0x00000001 /*KLF_ACTIVATE*/);
+            return _englishHkl;
+        }
+
         // pid→判断结果缓存：前台布局的输入法是否为系统内置（微软）输入法。
         // 依据：注册表 Keyboard Layouts\<KLID>\Ime File 是否位于 System32——
         // 微软内置 IME 的文件都在 System32，第三方（搜狗等）在各自安装目录
@@ -203,16 +220,26 @@ namespace InputMethodLock
         }
 
         // 强制前台窗口的输入法进入英文（字母数字）模式。
-        // 分层策略（v0.9）：微软内置输入法尊重标准转换状态写入；
-        // 搜狗等第三方输入法通常无视外部写入，改用"关闭 IME"（同 Ctrl+Space）实现英文直通
+        // v0.10 关键修正：记事本/浏览器/资源管理器等 TSF 应用拿不到 IMM32 上下文
+        // （hIMC=NULL），转换状态读写全部失效——此时改用布局级控制：
+        // 前台挂输入法布局（HKL 高字 E0xx）就强制切美式键盘；纯键盘布局打字恒为英文
         public static bool ForceEnglishMode(IntPtr hwnd)
         {
             IntPtr hIMC = ImmGetContext(hwnd);
             if (hIMC == IntPtr.Zero)
             {
-                // 无 IME 上下文：可能是纯英文键盘，也可能是 TSF 应用/权限隔离拿不到上下文
-                LogEnglishState(hwnd, IntPtr.Zero, "no-hIMC", "treated-as-english");
-                return true;
+                // TSF 应用：IMM32 通道不存在
+                uint tid = GetWindowThreadProcessId(hwnd, IntPtr.Zero);
+                IntPtr hkl = GetKeyboardLayout(tid);
+                if (IsImeLayout(hkl))
+                {
+                    IntPtr en = GetEnglishLayout();
+                    PostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, en);
+                    LogEnglishState(hwnd, hkl, "no-hIMC,ime-layout", "switch-to-english-layout");
+                    return true; // 异步生效，下个轮询周期复查
+                }
+                LogEnglishState(hwnd, hkl, "no-hIMC,plain-layout", "already-english");
+                return true; // 纯键盘布局打字恒为英文
             }
             try
             {

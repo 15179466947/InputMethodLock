@@ -202,12 +202,13 @@ namespace InputMethodLock
             _cmbLayouts.SelectedIndex = savedIndex >= 0 ? savedIndex : 0;
             UpdateLayoutComboEnabled();
 
-            // 解锁恢复下拉：第一项"（不切换）"，其后为全部布局（存完整 HKL）
-            string savedUnlock = string.IsNullOrEmpty(_config.UnlockLayout) ? "none" : _config.UnlockLayout;
+            // 解锁恢复下拉：自动（默认）| 不切换 | 全部布局（存完整 HKL）
+            string savedUnlock = string.IsNullOrEmpty(_config.UnlockLayout) ? "auto" : _config.UnlockLayout;
             int unlockIndex = 0;
             _cmbUnlock.Items.Clear();
+            _cmbUnlock.Items.Add(new LayoutItem("auto", "（自动：恢复锁定前的输入法）"));
             _cmbUnlock.Items.Add(new LayoutItem("none", "（不切换）"));
-            index = 1;
+            index = 2;
             foreach (IntPtr hkl in hkls)
             {
                 string storage = "hkl:" + hkl.ToInt64().ToString("X8", CultureInfo.InvariantCulture);
@@ -215,6 +216,8 @@ namespace InputMethodLock
                 if (string.Equals(storage, savedUnlock, StringComparison.OrdinalIgnoreCase)) unlockIndex = index;
                 index++;
             }
+            if (savedUnlock == "auto") unlockIndex = 0;
+            else if (savedUnlock == "none") unlockIndex = 1;
             _cmbUnlock.SelectedIndex = unlockIndex;
 
             Keys hotkeyKey = (Keys)(int)HotkeyHelper.ParseKey(_config.HotkeyKey);
