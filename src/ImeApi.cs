@@ -228,7 +228,25 @@ namespace InputMethodLock
             IntPtr hIMC = ImmGetContext(hwnd);
             if (hIMC == IntPtr.Zero)
             {
-                // TSF 应用：IMM32 通道不存在
+                // TSF 应用：IMM32 通道不存在。v0.11：GetKeyboardLayout 也看不到 TSF
+                // 输入法（搜狗激活时 HKL 仍是纯键盘布局），必须读 TSF 激活 profile
+                TsfProfile active;
+                if (TsfProfiles.GetActiveProfile(out active))
+                {
+                    if (active.IsInputProcessor)
+                    {
+                        // 激活的是输入法（搜狗/微软拼音）：切到该语言的纯键盘布局 → 英文直通
+                        ushort langid = active.langid != 0 ? active.langid : (ushort)0x0804;
+                        IntPtr hklDefault = new IntPtr(((long)langid << 16) | langid);
+                        bool ok = TsfProfiles.ActivateKeyboardLayoutProfile(langid, hklDefault);
+                        LogEnglishState(hwnd, hklDefault, "tsf,tip-active",
+                            "activate-keyboard-layout->" + (ok ? "ok" : "failed"));
+                        return true; // 异步生效，下个轮询周期复查
+                    }
+                    LogEnglishState(hwnd, active.hkl, "tsf,keyboard-layout-active", "already-english");
+                    return true; // 已是纯键盘布局 = 英文
+                }
+                // TSF 通道失败（COM 异常已记日志）→ 退回 HKL 判断兜底
                 uint tid = GetWindowThreadProcessId(hwnd, IntPtr.Zero);
                 IntPtr hkl = GetKeyboardLayout(tid);
                 if (IsImeLayout(hkl))
@@ -236,10 +254,10 @@ namespace InputMethodLock
                     IntPtr en = GetEnglishLayout();
                     PostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, en);
                     LogEnglishState(hwnd, hkl, "no-hIMC,ime-layout", "switch-to-english-layout");
-                    return true; // 异步生效，下个轮询周期复查
+                    return true;
                 }
                 LogEnglishState(hwnd, hkl, "no-hIMC,plain-layout", "already-english");
-                return true; // 纯键盘布局打字恒为英文
+                return true;
             }
             try
             {
@@ -291,7 +309,13 @@ namespace InputMethodLock
         public static bool ForceNativeMode(IntPtr hwnd)
         {
             IntPtr hIMC = ImmGetContext(hwnd);
-            if (hIMC == IntPtr.Zero) return false; // 纯英文键盘无 IME 上下文，无法锁定中文
+            if (hIMC == IntPtr.Zero)
+            {
+                // TSF 应用：中文输入法已激活但中英状态不可读写（v0.11），
+                // 盲发 Shift 兜底（1 秒限速），让输入法自己切回中文
+                TapShiftIfAllowed(hwnd);
+                return true;
+            }
             try
             {
                 if (!ImmGetOpenStatus(hIMC) && !ImmSetOpenStatus(hIMC, true)) return false;

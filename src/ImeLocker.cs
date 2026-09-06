@@ -18,6 +18,7 @@ namespace InputMethodLock
         private LockMode _mode = LockMode.English;
         private IntPtr _targetHkl = IntPtr.Zero;
         private IntPtr _chineseHkl = IntPtr.Zero; // 中文锁定时，前台无 IME 上下文的兜底布局
+        private Func<bool> _chineseImeActivator;  // TSF 通道：激活快照中的中文输入法 profile
         private HashSet<string> _exceptions = new HashSet<string>();
         private bool _lastLockedState;
 
@@ -54,6 +55,8 @@ namespace InputMethodLock
         public void SetTargetLayout(IntPtr hkl) { _targetHkl = hkl; }
 
         public void SetChineseFallbackLayout(IntPtr hkl) { _chineseHkl = hkl; }
+
+        public void SetChineseImeActivator(Func<bool> activator) { _chineseImeActivator = activator; }
 
         public void SetExceptions(IEnumerable<string> processNames)
         {
@@ -103,23 +106,24 @@ namespace InputMethodLock
             }
             else if (_mode == LockMode.Chinese)
             {
-                // 只看前台线程当前布局：已是简体中文输入法就直接锁中文，绝不动布局；
-                // 是英文键盘才发一次切换消息，等 IME 以默认中文模式起来后下一周期锁中文。
-                uint tid = ImeApi.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
-                IntPtr cur = ImeApi.GetKeyboardLayout(tid);
-                bool isChineseIme = (cur.ToInt64() & 0xFFFF) == 0x0804; // 简体中文语言
-                if (isChineseIme)
+                // v0.11：TSF 应用的真实输入法状态在激活 profile 里（HKL 看不到）。
+                // 激活的是中文输入法 → 锁其中英状态；不是 → 先激活中文输入法 profile
+                TsfProfile active;
+                bool tsf = TsfProfiles.GetActiveProfile(out active);
+                bool tipChinese = tsf && active.IsInputProcessor && active.langid == 0x0804;
+                if (tsf && !tipChinese)
                 {
-                    ok = ImeApi.ForceNativeMode(hwnd);
-                }
-                else if (_chineseHkl != IntPtr.Zero)
-                {
-                    ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, _chineseHkl);
-                    ok = true;
+                    bool activated = _chineseImeActivator != null && _chineseImeActivator();
+                    if (!activated && _chineseHkl != IntPtr.Zero)
+                    {
+                        ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, _chineseHkl);
+                        activated = true;
+                    }
+                    ok = activated; // 激活后输入法以默认中文模式启动，下个周期复查
                 }
                 else
                 {
-                    ok = ImeApi.ForceNativeMode(hwnd); // 系统没有中文输入法，尽力而为
+                    ok = ImeApi.ForceNativeMode(hwnd);
                 }
             }
             else
