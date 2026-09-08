@@ -57,7 +57,7 @@ namespace InputMethodLock
             // 硬编码坐标在 125%/150% DPI 下会错位，按 DPI 基准 96 缩放全部 Bounds
             AutoScaleMode = AutoScaleMode.Dpi;
             AutoScaleDimensions = new SizeF(96F, 96F);
-            ClientSize = new Size(420, 458);
+            ClientSize = new Size(420, 484);
 
             _chkLockNow = new CheckBox();
             _chkLockNow.Text = "启用锁定（立即生效）";
@@ -66,7 +66,7 @@ namespace InputMethodLock
 
             var groupMode = new GroupBox();
             groupMode.Text = "锁定模式";
-            groupMode.Bounds = new Rectangle(12, 34, 396, 158);
+            groupMode.Bounds = new Rectangle(12, 34, 396, 184);
 
             _rbEnglish = new RadioButton();
             _rbEnglish.Text = "英文锁定（强制英文键盘，输入必为英文）";
@@ -80,38 +80,39 @@ namespace InputMethodLock
             _rbChinese.CheckedChanged += delegate { UpdateLayoutComboEnabled(); };
             groupMode.Controls.Add(_rbChinese);
 
+            // 中文锁定目标紧跟在「中文锁定」单选下方，语义更直观
+            var lblChinese = new Label();
+            lblChinese.Text = "中文锁定目标：";
+            lblChinese.Bounds = new Rectangle(10, 72, 120, 20);
+            groupMode.Controls.Add(lblChinese);
+
+            _cmbChinese = new ComboBox();
+            _cmbChinese.DropDownStyle = ComboBoxStyle.DropDownList;
+            _cmbChinese.Bounds = new Rectangle(30, 94, 350, 24);
+            groupMode.Controls.Add(_cmbChinese);
+
             _rbLayout = new RadioButton();
             _rbLayout.Text = "布局锁定（强制指定键盘布局）：";
-            _rbLayout.Bounds = new Rectangle(10, 70, 200, 20);
+            _rbLayout.Bounds = new Rectangle(10, 124, 370, 20);
             _rbLayout.CheckedChanged += delegate { UpdateLayoutComboEnabled(); };
             groupMode.Controls.Add(_rbLayout);
 
             _cmbLayouts = new ComboBox();
             _cmbLayouts.DropDownStyle = ComboBoxStyle.DropDownList;
-            _cmbLayouts.Bounds = new Rectangle(30, 93, 350, 24);
+            _cmbLayouts.Bounds = new Rectangle(30, 146, 350, 24);
             groupMode.Controls.Add(_cmbLayouts);
-
-            var lblChinese = new Label();
-            lblChinese.Text = "中文锁定目标：";
-            lblChinese.Bounds = new Rectangle(10, 122, 120, 20);
-            groupMode.Controls.Add(lblChinese);
-
-            _cmbChinese = new ComboBox();
-            _cmbChinese.DropDownStyle = ComboBoxStyle.DropDownList;
-            _cmbChinese.Bounds = new Rectangle(30, 144, 350, 24);
-            groupMode.Controls.Add(_cmbChinese);
 
             Controls.Add(groupMode);
 
             var lblHotkey = new Label();
             lblHotkey.Text = "临时开关热键：";
-            lblHotkey.Bounds = new Rectangle(16, 204, 100, 20);
+            lblHotkey.Bounds = new Rectangle(16, 230, 100, 20);
             Controls.Add(lblHotkey);
 
             _txtHotkey = new TextBox();
             _txtHotkey.ReadOnly = true;
             _txtHotkey.BackColor = SystemColors.Window;
-            _txtHotkey.Bounds = new Rectangle(120, 201, 180, 24);
+            _txtHotkey.Bounds = new Rectangle(120, 227, 180, 24);
             _txtHotkey.KeyDown += OnHotkeyKeyDown;
             _txtHotkey.Enter += delegate { _capturing = true; };
             _txtHotkey.Leave += delegate { _capturing = false; }; // 只进不出的捕获态会吞掉后续所有按键
@@ -120,49 +121,49 @@ namespace InputMethodLock
             var lblHotkeyHint = new Label();
             lblHotkeyHint.Text = "点击后按下快捷键（需含 Ctrl/Alt/Shift），按 Delete 清除";
             lblHotkeyHint.ForeColor = Color.Gray;
-            lblHotkeyHint.Bounds = new Rectangle(120, 226, 300, 16);
+            lblHotkeyHint.Bounds = new Rectangle(120, 252, 300, 16);
             Controls.Add(lblHotkeyHint);
 
             var lblUnlock = new Label();
             lblUnlock.Text = "停用锁定时切到：";
-            lblUnlock.Bounds = new Rectangle(16, 252, 100, 20);
+            lblUnlock.Bounds = new Rectangle(16, 278, 100, 20);
             Controls.Add(lblUnlock);
 
             _cmbUnlock = new ComboBox();
             _cmbUnlock.DropDownStyle = ComboBoxStyle.DropDownList;
-            _cmbUnlock.Bounds = new Rectangle(122, 249, 178, 24);
+            _cmbUnlock.Bounds = new Rectangle(122, 275, 178, 24);
             Controls.Add(_cmbUnlock);
 
             var lblExceptions = new Label();
             lblExceptions.Text = "例外程序（这些进程不锁定，进程名用英文逗号分隔）：";
-            lblExceptions.Bounds = new Rectangle(16, 280, 390, 20);
+            lblExceptions.Bounds = new Rectangle(16, 306, 390, 20);
             Controls.Add(lblExceptions);
 
             _txtExceptions = new TextBox();
             _txtExceptions.Multiline = true;
             _txtExceptions.ScrollBars = ScrollBars.Vertical;
-            _txtExceptions.Bounds = new Rectangle(16, 302, 392, 50);
+            _txtExceptions.Bounds = new Rectangle(16, 328, 392, 50);
             Controls.Add(_txtExceptions);
 
             _chkEnabled = new CheckBox();
             _chkEnabled.Text = "下次启动时自动启用锁定";
-            _chkEnabled.Bounds = new Rectangle(16, 360, 220, 20);
+            _chkEnabled.Bounds = new Rectangle(16, 386, 220, 20);
             Controls.Add(_chkEnabled);
 
             _chkAutoStart = new CheckBox();
             _chkAutoStart.Text = "开机自动运行";
-            _chkAutoStart.Bounds = new Rectangle(16, 384, 200, 20);
+            _chkAutoStart.Bounds = new Rectangle(16, 410, 200, 20);
             Controls.Add(_chkAutoStart);
 
             _btnSave = new Button();
             _btnSave.Text = "保存";
-            _btnSave.Bounds = new Rectangle(230, 412, 80, 28);
+            _btnSave.Bounds = new Rectangle(230, 438, 80, 28);
             _btnSave.Click += delegate { Save(); };
             Controls.Add(_btnSave);
 
             _btnCancel = new Button();
             _btnCancel.Text = "取消";
-            _btnCancel.Bounds = new Rectangle(322, 412, 80, 28);
+            _btnCancel.Bounds = new Rectangle(322, 438, 80, 28);
             _btnCancel.Click += delegate { Close(); };
             Controls.Add(_btnCancel);
 
