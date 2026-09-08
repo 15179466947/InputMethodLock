@@ -69,8 +69,6 @@ namespace InputMethodLock
         private readonly ImeWatcher _watcher = new ImeWatcher();
         private bool _hotkeyFailed; // 热键注册失败（被占用等），启动/保存后气泡提示
         private IntPtr _userHklSnapshot; // 启用锁定时用户正在用的键盘布局 HKL
-        private TsfProfile _snapTsfProfile; // 启用锁定时激活的 TSF 输入法 profile（精确还原搜狗等）
-        private bool _snapTsfValid;
 
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern int GetSystemMetrics(int nIndex);
@@ -221,17 +219,6 @@ namespace InputMethodLock
             if (chinese == IntPtr.Zero)
                 chinese = ImeApi.LoadKeyboardLayout("00000804", 0x00000001 /*KLF_ACTIVATE*/);
             _locker.SetChineseFallbackLayout(chinese);
-            // TSF 通道：优先激活快照中的中文输入法 profile（如用户的搜狗）
-            _locker.SetChineseImeActivator(delegate
-            {
-                if (_snapTsfValid && _snapTsfProfile.IsInputProcessor
-                    && _snapTsfProfile.langid == 0x0804)
-                {
-                    Logger.Log("Chinese lock: activate snapshot TSF profile");
-                    return TsfProfiles.Activate(_snapTsfProfile);
-                }
-                return false;
-            });
             _locker.SetExceptions(_config.Exceptions);
         }
 
@@ -292,8 +279,9 @@ namespace InputMethodLock
             SyncLockStateUi();
         }
 
-        // 记住用户当前输入法（HKL + TSF profile）：解锁时自动恢复（auto 模式）；
-        // 若快照是简体中文输入法，中文锁定的兜底切换也优先用它
+        // 记住用户当前输入法（HKL），解锁时自动恢复（auto 模式）。
+        // 说明：TSF profile 快照已移除——新接口 GetActiveProfile 在本机恒返回
+        // E_INVALIDARG，HKL 是跨进程唯一可靠的输入法标识。
         private void TakeSnapshot()
         {
             try
@@ -302,20 +290,12 @@ namespace InputMethodLock
                 if (hwnd == IntPtr.Zero) return;
                 uint tid = ImeApi.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
                 _userHklSnapshot = ImeApi.GetKeyboardLayout(tid);
-                Logger.Log("Snapshot user IME: {0}", _userHklSnapshot.ToInt64().ToString("X8"));
-
-                _snapTsfValid = TsfProfiles.GetActiveProfile(out _snapTsfProfile);
-                if (_snapTsfValid)
-                {
-                    Logger.Log("Snapshot TSF profile: {0}", _snapTsfProfile.Describe());
-                    if (_snapTsfProfile.IsInputProcessor
-                        && _snapTsfProfile.langid == 0x0804)
-                    {
-                        _locker.SetChineseFallbackLayout(_userHklSnapshot);
-                    }
-                }
+                Logger.Log("Snapshot user layout: {0}", _userHklSnapshot.ToInt64().ToString("X8"));
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Logger.Log("Snapshot failed: {0}", ex.Message);
+            }
         }
 
         private void DisableLock()
@@ -327,34 +307,21 @@ namespace InputMethodLock
         }
 
         // 停用锁定时切换输入法：auto=恢复锁定前的快照；none=不动；hkl:xx=指定输入法。
-        // 恢复优先走 TSF profile 激活（能精确还原搜狗等 IME），HKL 消息做兜底强化
+        // 通道统一走 WM_INPUTLANGCHANGEREQUEST（实测可靠的跨进程切换方式）
         private void RestoreUnlockLayout()
         {
             string val = string.IsNullOrEmpty(_config.UnlockLayout) ? "auto" : _config.UnlockLayout;
             if (val == "none") return;
 
-            IntPtr hkl;
-            if (val == "auto")
-            {
-                hkl = _userHklSnapshot;
-                if (hkl == IntPtr.Zero && !_snapTsfValid) return; // 无任何快照可恢复
-                if (_snapTsfValid)
-                {
-                    if (TsfProfiles.Activate(_snapTsfProfile))
-                        Logger.Log("Unlock: TSF profile restored ({0})", _snapTsfProfile.Describe());
-                }
-                if (hkl == IntPtr.Zero) return;
-                Logger.Log("Unlock: restore layout {0}", hkl.ToInt64().ToString("X8"));
-            }
-            else
-            {
-                hkl = ParseLayoutStorage(val);
-                if (hkl == IntPtr.Zero) return;
-            }
+            IntPtr hkl = val == "auto" ? _userHklSnapshot : ParseLayoutStorage(val);
+            if (hkl == IntPtr.Zero) return;
 
             IntPtr hwnd = ImeApi.GetForegroundWindow();
-            if (hwnd != IntPtr.Zero)
-                ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, hkl);
+            if (hwnd == IntPtr.Zero) return;
+            bool posted = ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST,
+                IntPtr.Zero, hkl);
+            Logger.Log("Unlock: restore layout {0} posted={1}",
+                hkl.ToInt64().ToString("X8"), posted);
         }
 
         // 刷新托盘图标、菜单勾选、提示文字与已打开的设置窗口

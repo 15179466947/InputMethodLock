@@ -10,8 +10,16 @@ namespace InputMethodLock
         private const string MutexName = "Local\\InputMethodLock_SingleInstance";
 
         [STAThread]
-        private static void Main()
+        private static void Main(string[] args)
         {
+            // 诊断模式：不占单实例锁，可反复运行
+            if (args != null && Array.IndexOf(args, "--diag") >= 0)
+            {
+                Application.EnableVisualStyles();
+                Diagnostics.Run();
+                return;
+            }
+
             bool createdNew;
             Mutex mutex = null;
             try

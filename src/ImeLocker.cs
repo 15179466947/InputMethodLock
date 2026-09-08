@@ -18,7 +18,6 @@ namespace InputMethodLock
         private LockMode _mode = LockMode.English;
         private IntPtr _targetHkl = IntPtr.Zero;
         private IntPtr _chineseHkl = IntPtr.Zero; // 中文锁定时，前台无 IME 上下文的兜底布局
-        private Func<bool> _chineseImeActivator;  // TSF 通道：激活快照中的中文输入法 profile
         private HashSet<string> _exceptions = new HashSet<string>();
         private bool _lastLockedState;
 
@@ -55,8 +54,6 @@ namespace InputMethodLock
         public void SetTargetLayout(IntPtr hkl) { _targetHkl = hkl; }
 
         public void SetChineseFallbackLayout(IntPtr hkl) { _chineseHkl = hkl; }
-
-        public void SetChineseImeActivator(Func<bool> activator) { _chineseImeActivator = activator; }
 
         public void SetExceptions(IEnumerable<string> processNames)
         {
@@ -106,31 +103,109 @@ namespace InputMethodLock
             }
             else if (_mode == LockMode.Chinese)
             {
-                // v0.11：TSF 应用的真实输入法状态在激活 profile 里（HKL 看不到）。
-                // 激活的是中文输入法 → 锁其中英状态；不是 → 先激活中文输入法 profile
-                TsfProfile active;
-                bool tsf = TsfProfiles.GetActiveProfile(out active);
-                bool tipChinese = tsf && active.IsInputProcessor && active.langid == 0x0804;
-                if (tsf && !tipChinese)
-                {
-                    bool activated = _chineseImeActivator != null && _chineseImeActivator();
-                    if (!activated && _chineseHkl != IntPtr.Zero)
-                    {
-                        ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, _chineseHkl);
-                        activated = true;
-                    }
-                    ok = activated; // 激活后输入法以默认中文模式启动，下个周期复查
-                }
-                else
-                {
-                    ok = ImeApi.ForceNativeMode(hwnd);
-                }
+                ok = ForceChinese(hwnd);
             }
             else
             {
-                ok = ImeApi.ForceEnglishMode(hwnd);
+                ok = ForceEnglish(hwnd);
             }
             UpdateState(ok);
+        }
+
+        // —— 中文锁定 ——
+        // 能做的：确保中文输入法（微软拼音/搜狗等）处于激活状态，从英文键盘切回中文。
+        // 做不到的：跨进程读不到输入法自身的"中/英模式"——实测
+        // GetActiveLanguageProfile 对已启用的输入法恒返回 S_OK（与当前模式无关），
+        // ImmGetContext 跨进程恒为 0。所以中文输入法激活后，其中英切换仍归用户控制。
+        private const int ChineseLangId = 0x0804;
+        private string _chnLogSig;
+
+        private bool ForceChinese(IntPtr hwnd)
+        {
+            uint tid = ImeApi.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
+            IntPtr current = ImeApi.GetKeyboardLayout(tid);
+            if ((int)(current.ToInt64() & 0xFFFF) == ChineseLangId)
+                return true; // 已是中文语言（中文输入法或中文键盘）
+
+            // 精确激活用户已启用的中文输入法（注册表枚举 + 旧 TSF 接口，本机可用）
+            bool activated = TsfProfiles.ActivateChineseIme(
+                ImeApi.GetEnabledInputProcessors(ChineseLangId));
+
+            // 兜底：切到中文键盘布局（拿不到输入法时至少把语言切回中文）
+            if (!activated && _chineseHkl != IntPtr.Zero)
+                ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, _chineseHkl);
+
+            LogChn(hwnd, current, activated);
+            return false; // 异步生效，下个周期复查
+        }
+
+        private void LogChn(IntPtr hwnd, IntPtr current, bool activated)
+        {
+            string sig = current.ToInt64().ToString("X8") + "|" + activated;
+            if (sig == _chnLogSig) return;
+            _chnLogSig = sig;
+            Logger.Log("ChineseLock: proc={0} current={1:X8} activate-tip={2} fallback={3:X8}",
+                ImeApi.GetForegroundProcessName(hwnd) ?? "-", current.ToInt64(), activated,
+                _chineseHkl.ToInt64());
+        }
+        // 真机实测结论（Win10 19045，本机）：
+        //  · TSF 新接口 ITfInputProcessorProfileMgr 所有方法恒返回 E_INVALIDARG，不可用
+        //  · ImmGetContext 跨进程恒返回 0 —— IMM32 只对自身进程的窗口有效
+        //  · 唯一可靠通道是 PostMessage(WM_INPUTLANGCHANGEREQUEST)：前台线程 HKL
+        //    实测可从 08040804 切到 04090409，也能再切回来
+        // 关键陷阱：微软拼音处于中文输入模式时，前台 HKL 依旧是 08040804
+        // （输入法的 substitute layout），所以"HKL 是纯键盘布局就是英文"是错误判据，
+        // 必须切到真正的英文键盘布局才算锁定。
+        private int _engCandidate;
+        private int _engAttempts;
+        private string _engLogSig;
+
+        private bool ForceEnglish(IntPtr hwnd)
+        {
+            uint tid = ImeApi.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
+            IntPtr current = ImeApi.GetKeyboardLayout(tid);
+
+            IntPtr[] cands = ImeApi.EnglishLayoutCandidates((int)(current.ToInt64() & 0xFFFF));
+            if (cands.Length == 0)
+            {
+                LogEng(hwnd, current, IntPtr.Zero, false, "no-candidate");
+                return false;
+            }
+
+            // 已停在首选（真正的英文键盘布局）→ 锁定已生效
+            if (current == cands[0])
+            {
+                _engAttempts = 0;
+                LogEng(hwnd, current, current, true, "locked");
+                return true;
+            }
+
+            if (_engCandidate >= cands.Length) _engCandidate = 0;
+            if (_engAttempts >= 10) // 同一候选试满 ~1s 仍未切动 → 换下一个
+            {
+                _engAttempts = 0;
+                _engCandidate = (_engCandidate + 1) % cands.Length;
+            }
+            IntPtr target = cands[_engCandidate];
+            _engAttempts++;
+
+            bool posted = ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST,
+                IntPtr.Zero, target);
+            ImeApi.ForceImmEnglish(hwnd);
+            LogEng(hwnd, current, target, posted, "switch");
+            return false; // 异步生效，下个周期复查 HKL
+        }
+
+        // 状态变化才记日志：100ms 轮询下同一状态每秒会打 10 条，首条反而被冲掉
+        private void LogEng(IntPtr hwnd, IntPtr from, IntPtr to, bool posted, string action)
+        {
+            string sig = action + "|" + from.ToInt64().ToString("X8") + "|"
+                + to.ToInt64().ToString("X8") + "|" + posted;
+            if (sig == _engLogSig) return;
+            _engLogSig = sig;
+            Logger.Log("EnglishLock: proc={0} {1} {2:X8} -> {3:X8} posted={4}",
+                ImeApi.GetForegroundProcessName(hwnd) ?? "-", action,
+                from.ToInt64(), to.ToInt64(), posted);
         }
 
         private void UpdateState(bool enforcedOk)

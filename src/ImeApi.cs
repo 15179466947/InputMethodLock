@@ -84,14 +84,115 @@ namespace InputMethodLock
             return ((hkl.ToInt64() >> 16) & 0xF000) == 0xE000;
         }
 
-        private static IntPtr _englishHkl;
+        private const uint KLF_ACTIVATE = 0x00000001;
 
-        // 美式英文键盘（00000409）：TSF 应用下英文锁定的强制目标
-        public static IntPtr GetEnglishLayout()
+        // 系统已加载的键盘布局列表（用户很少增删语言，缓存 60 秒即可）
+        private static IntPtr[] _layoutCache;
+        private static int _layoutCacheTick;
+
+        public static IntPtr[] GetLayoutList()
         {
-            if (_englishHkl == IntPtr.Zero)
-                _englishHkl = LoadKeyboardLayout("00000409", 0x00000001 /*KLF_ACTIVATE*/);
-            return _englishHkl;
+            if (_layoutCache != null && Environment.TickCount - _layoutCacheTick < 60000)
+                return _layoutCache;
+            int count = (int)GetKeyboardLayoutList(0, null);
+            IntPtr[] list = count > 0 ? new IntPtr[count] : new IntPtr[0];
+            if (count > 0) GetKeyboardLayoutList(count, list);
+            _layoutCache = list;
+            _layoutCacheTick = Environment.TickCount;
+            return list;
+        }
+
+        // 用户已启用的输入法（TIP）条目
+        internal struct TipInfo
+        {
+            public ushort LangId;
+            public Guid Clsid;
+            public Guid GuidProfile;
+        }
+
+        // 从注册表枚举用户已启用的输入法：
+        // HKCU\Control Panel\International\User Profile\<语言tag> 下的值名形如
+        // "0804:{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}{FA550B04-5AD7-411F-A5AC-CA038EC515D7}"
+        // 这是"中文锁定"要激活微软拼音/搜狗等具体输入法的唯一信息来源——
+        // 系统已加载布局里通常只有 08040804 这种 substitute layout，拿不到输入法本体。
+        public static TipInfo[] GetEnabledInputProcessors(ushort langId)
+        {
+            var list = new List<TipInfo>();
+            try
+            {
+                using (RegistryKey root = Registry.CurrentUser.OpenSubKey(
+                    @"Control Panel\International\User Profile"))
+                {
+                    if (root == null) return list.ToArray();
+                    foreach (string lang in root.GetSubKeyNames())
+                    {
+                        using (RegistryKey k = root.OpenSubKey(lang))
+                        {
+                            if (k == null) continue;
+                            foreach (string name in k.GetValueNames())
+                            {
+                                TipInfo t;
+                                if (TryParseTipName(name, langId, out t) && !list.Contains(t))
+                                    list.Add(t);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Logger.Throttle("tip-enum", 10000))
+                    Logger.Log("Enumerate input processors failed: {0}", ex.Message);
+            }
+            return list.ToArray();
+        }
+
+        private static bool TryParseTipName(string name, ushort langId, out TipInfo info)
+        {
+            info = new TipInfo();
+            if (name == null || name.Length < 6 || name[4] != ':') return false;
+            ushort l;
+            if (!ushort.TryParse(name.Substring(0, 4),
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out l)) return false;
+            if (l != langId) return false;
+
+            string rest = name.Substring(5);
+            int split = rest.IndexOf('}');
+            if (split < 0) return false;
+            Guid clsid, guid;
+            if (!Guid.TryParse(rest.Substring(0, split + 1), out clsid)) return false;
+            if (!Guid.TryParse(rest.Substring(split + 1), out guid)) return false;
+
+            info.LangId = l;
+            info.Clsid = clsid;
+            info.GuidProfile = guid;
+            return true;
+        }
+
+        // 英文锁定的候选目标布局（按优先级）：
+        //  1. 系统已加载的英文键盘布局（低字 0x0409）—— 唯一可靠目标。
+        //     实测：微软拼音处于中文输入模式时，前台线程 HKL 依旧是 08040804
+        //     （输入法的 substitute layout），只看 HKL 无法区分中英，
+        //     但切到 0409 布局后没有 IME，打字必然是英文。
+        //  2. LoadKeyboardLayout 加载美式英文（系统没预装英文键盘时）
+        //  3. preferLangId 语言的纯键盘布局（如 08040804）—— 最后的退路：
+        //     不能保证切走 IME，但至少把输入法状态拉回该语言的直通模式
+        public static IntPtr[] EnglishLayoutCandidates(int preferLangId)
+        {
+            var list = new List<IntPtr>();
+
+            IntPtr en = FindLayoutByLanguage(0x0409);
+            if (en == IntPtr.Zero) en = LoadKeyboardLayout("00000409", KLF_ACTIVATE);
+            if (en != IntPtr.Zero) list.Add(en);
+
+            int lang = preferLangId & 0xFFFF;
+            if (lang != 0 && lang != 0x0409)
+            {
+                IntPtr plain = new IntPtr(((long)lang << 16) | (uint)lang);
+                if (!list.Contains(plain)) list.Add(plain);
+            }
+            return list.ToArray();
         }
 
         // pid→判断结果缓存：前台布局的输入法是否为系统内置（微软）输入法。
@@ -190,11 +291,7 @@ namespace InputMethodLock
         // 在系统已加载的键盘布局中找指定语言（低字 langId，如 0x0804=简体中文）的布局
         public static IntPtr FindLayoutByLanguage(int langId)
         {
-            int count = (int)GetKeyboardLayoutList(0, null);
-            if (count <= 0) return IntPtr.Zero;
-            IntPtr[] hkls = new IntPtr[count];
-            GetKeyboardLayoutList(count, hkls);
-            foreach (IntPtr hkl in hkls)
+            foreach (IntPtr hkl in GetLayoutList())
             {
                 if ((int)(hkl.ToInt64() & 0xFFFF) == langId) return hkl;
             }
@@ -206,12 +303,8 @@ namespace InputMethodLock
         // 避免"中文锁定"落到纯键盘布局（打字恒为英文）导致切过去仍是英文
         public static IntPtr FindImeLayoutByLanguage(int langId)
         {
-            int count = (int)GetKeyboardLayoutList(0, null);
-            if (count <= 0) return IntPtr.Zero;
-            IntPtr[] hkls = new IntPtr[count];
-            GetKeyboardLayoutList(count, hkls);
             IntPtr fallback = IntPtr.Zero;
-            foreach (IntPtr hkl in hkls)
+            foreach (IntPtr hkl in GetLayoutList())
             {
                 if ((int)(hkl.ToInt64() & 0xFFFF) != langId) continue;
                 if (IsImeLayout(hkl)) return hkl;      // 真输入法优先
@@ -220,102 +313,47 @@ namespace InputMethodLock
             return fallback;
         }
 
-        // 英文锁定状态变化日志：只在 (进程|布局|hIMC|开关|转换状态) 元组变化时记一条，
-        // 用于定位"锁定无效但日志全空"的静默短路分支
-        private static string _lastEngState;
-
-        private static void LogEnglishState(IntPtr hwnd, IntPtr hkl, string state, string result)
+        // 英文锁定的执行动作：把前台窗口从输入法切到纯键盘布局（打字恒为英文）。
+        // hkl 由 ImeLocker 依据 TSF 激活 profile 选出，并在长时间未生效时轮转候选。
+        // 三条通道同时走，互为补充：
+        //   TSF   —— 对记事本/浏览器/Eclipse 等无 IMM32 上下文的窗口是唯一有效路径
+        //   消息  —— "每个应用单独输入法"模式下，TSF 全局激活可能不覆盖该窗口
+        //   IMM32 —— 老应用还可能停在中文模式，直接写转换状态
+        public static bool ForceEnglishByLayout(IntPtr hwnd, IntPtr hkl)
         {
-            try
-            {
-                string klid = hkl == IntPtr.Zero ? "-" : hkl.ToInt64().ToString("X8");
-                string sig = (GetForegroundProcessName(hwnd) ?? "-") + "|" + klid + "|" + state + "|" + result;
-                if (sig == _lastEngState) return;
-                _lastEngState = sig;
-                Logger.Log("EnglishLock: proc={0} klid={1} state={2} -> {3}",
-                    GetForegroundProcessName(hwnd) ?? "-", klid, state, result);
-            }
-            catch { }
+            if (hkl == IntPtr.Zero) return false;
+
+            TsfProfiles.ActivateKeyboardLayout(hkl);
+
+            uint tid = GetWindowThreadProcessId(hwnd, IntPtr.Zero);
+            if (GetKeyboardLayout(tid) != hkl)
+                PostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, hkl);
+
+            ForceImmEnglish(hwnd);
+            return true;
         }
 
-        // 强制前台窗口的输入法进入英文（字母数字）模式。
-        // v0.10 关键修正：记事本/浏览器/资源管理器等 TSF 应用拿不到 IMM32 上下文
-        // （hIMC=NULL），转换状态读写全部失效——此时改用布局级控制：
-        // 前台挂输入法布局（HKL 高字 E0xx）就强制切美式键盘；纯键盘布局打字恒为英文
-        public static bool ForceEnglishMode(IntPtr hwnd)
+        // IMM32 通道：注意 ImmGetContext 只对**自身进程**的窗口有效，
+        // 跨进程调用前台窗口恒返回 0（实测），因此这里通常直接跳过，
+        // 真正的切换由 ForceEnglishByLayout 的消息通道完成。保留它是为老应用兜底。
+        public static bool ForceImmEnglish(IntPtr hwnd)
         {
             IntPtr hIMC = ImmGetContext(hwnd);
-            if (hIMC == IntPtr.Zero)
-            {
-                // TSF 应用：IMM32 通道不存在。v0.11：GetKeyboardLayout 也看不到 TSF
-                // 输入法（搜狗激活时 HKL 仍是纯键盘布局），必须读 TSF 激活 profile
-                TsfProfile active;
-                if (TsfProfiles.GetActiveProfile(out active))
-                {
-                    if (active.IsInputProcessor)
-                    {
-                        // 激活的是输入法（搜狗/微软拼音）：切到该语言的纯键盘布局 → 英文直通
-                        ushort langid = active.langid != 0 ? active.langid : (ushort)0x0804;
-                        IntPtr hklDefault = new IntPtr(((long)langid << 16) | langid);
-                        bool ok = TsfProfiles.ActivateKeyboardLayoutProfile(langid, hklDefault);
-                        LogEnglishState(hwnd, hklDefault, "tsf,tip-active",
-                            "activate-keyboard-layout->" + (ok ? "ok" : "failed"));
-                        return true; // 异步生效，下个轮询周期复查
-                    }
-                    LogEnglishState(hwnd, active.hkl, "tsf,keyboard-layout-active", "already-english");
-                    return true; // 已是纯键盘布局 = 英文
-                }
-                // TSF 通道失败（COM 异常已记日志）→ 退回 HKL 判断兜底
-                uint tid = GetWindowThreadProcessId(hwnd, IntPtr.Zero);
-                IntPtr hkl = GetKeyboardLayout(tid);
-                if (IsImeLayout(hkl))
-                {
-                    IntPtr en = GetEnglishLayout();
-                    PostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, en);
-                    LogEnglishState(hwnd, hkl, "no-hIMC,ime-layout", "switch-to-english-layout");
-                    return true;
-                }
-                LogEnglishState(hwnd, hkl, "no-hIMC,plain-layout", "already-english");
-                return true;
-            }
+            if (hIMC == IntPtr.Zero) return false;
             try
             {
-                bool open = ImmGetOpenStatus(hIMC);
-                if (!open)
-                {
-                    LogEnglishState(hwnd, IntPtr.Zero, "ime-closed", "english-passthrough");
-                    return true; // IME 已关闭 = 英文直通
-                }
+                if (!ImmGetOpenStatus(hIMC)) return true;           // IME 已关 = 英文直通
                 int conversion = 0, sentence = 0;
-                if (!ImmGetConversionStatus(hIMC, ref conversion, ref sentence))
-                {
-                    LogEnglishState(hwnd, IntPtr.Zero, "conv-read-failed", "treated-as-english");
-                    return true;
-                }
-                if (conversion == IME_CMODE_ALPHANUMERIC)
-                {
-                    LogEnglishState(hwnd, IntPtr.Zero, "already-english", "ok");
-                    return true; // 已是英文
-                }
+                if (!ImmGetConversionStatus(hIMC, ref conversion, ref sentence)) return true;
+                if (conversion == IME_CMODE_ALPHANUMERIC) return true; // 已是英文模式
 
                 uint tid = GetWindowThreadProcessId(hwnd, IntPtr.Zero);
                 IntPtr hkl = GetKeyboardLayout(tid);
-                bool sysIme = IsSystemIme(hkl);
-                bool ok;
-                if (sysIme)
-                {
-                    ok = ImmSetConversionStatus(hIMC, IME_CMODE_ALPHANUMERIC, sentence);
-                    LogEnglishState(hwnd, hkl, "open,conv=" + conversion,
-                        "conv-write(system-ime)->" + (ok ? "ok" : "failed"));
-                }
+                if (IsSystemIme(hkl))
+                    ImmSetConversionStatus(hIMC, IME_CMODE_ALPHANUMERIC, sentence);
                 else
-                {
-                    // 第三方输入法：关闭 IME → 按键直通英文
-                    ok = ImmSetOpenStatus(hIMC, false) && !ImmGetOpenStatus(hIMC);
-                    LogEnglishState(hwnd, hkl, "open,conv=" + conversion,
-                        "close-ime(3rd-party)->" + (ok ? "ok" : "failed"));
-                }
-                return ok;
+                    ImmSetOpenStatus(hIMC, false); // 第三方输入法：关闭 IME 让按键直通
+                return true;
             }
             finally
             {
