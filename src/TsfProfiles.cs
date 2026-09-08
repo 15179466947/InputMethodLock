@@ -101,10 +101,15 @@ namespace InputMethodLock
             try
             {
                 ITfInputProcessorProfileMgr mgr = CreateMgr();
-                Guid clsid = profile.clsid;
-                Guid guid = profile.guidProfile;
+                // 按 MSDN 契约归一化参数，否则 ActivateProfile 会静默失败：
+                // - 键盘布局(KEYBOARDLAYOUT)：clsid / guidProfile 必须为 GUID_EMPTY
+                // - 输入法(INPUTPROCESSOR)：hkl 必须为 NULL
+                bool isTip = profile.dwProfileType == ProfileTypeInputProcessor;
+                Guid clsid = isTip ? profile.clsid : Guid.Empty;
+                Guid guid = isTip ? profile.guidProfile : Guid.Empty;
+                IntPtr hkl = isTip ? IntPtr.Zero : profile.hkl;
                 mgr.ActivateProfile(profile.dwProfileType, profile.langid,
-                    ref clsid, ref guid, profile.hkl, 0);
+                    ref clsid, ref guid, hkl, 0);
                 return true;
             }
             catch (Exception ex)

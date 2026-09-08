@@ -117,7 +117,7 @@ namespace InputMethodLock
                 if (e.Button == MouseButtons.Left) ToggleLock();
             };
 
-            if (_config.LockEnabled) _locker.Start();
+            if (_config.LockEnabled) EnableLock();
             SyncLockStateUi();
             Logger.Log("Started. mode={0}, enabled={1}, hotkeyFailed={2}",
                 _config.Mode, _config.LockEnabled, _hotkeyFailed);
@@ -217,7 +217,7 @@ namespace InputMethodLock
             else _locker.SetMode(LockMode.English);
             _locker.SetTargetLayout(ParseLayoutStorage(_config.TargetLayout));
             // 系统里的简体中文输入法，供"中文锁定"在英文键盘上切换
-            IntPtr chinese = ImeApi.FindLayoutByLanguage(0x0804);
+            IntPtr chinese = ImeApi.FindImeLayoutByLanguage(0x0804);
             if (chinese == IntPtr.Zero)
                 chinese = ImeApi.LoadKeyboardLayout("00000804", 0x00000001 /*KLF_ACTIVATE*/);
             _locker.SetChineseFallbackLayout(chinese);

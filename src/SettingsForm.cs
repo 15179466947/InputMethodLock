@@ -50,7 +50,9 @@ namespace InputMethodLock
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            Font = new Font("Microsoft YaHei UI", 9f);
+            // 用 Pixel 单位（12px@96DPI 等同原 9pt）：AutoScaleMode=Dpi + PerMonitorV2
+            // 会把 point 字号的逻辑像素再乘一次 DPI 系数，导致字号二次放大、标签被截断
+            Font = new Font("Microsoft YaHei UI", 12f, GraphicsUnit.Pixel);
             // 硬编码坐标在 125%/150% DPI 下会错位，按 DPI 基准 96 缩放全部 Bounds
             AutoScaleMode = AutoScaleMode.Dpi;
             AutoScaleDimensions = new SizeF(96F, 96F);

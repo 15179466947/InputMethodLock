@@ -201,6 +201,25 @@ namespace InputMethodLock
             return IntPtr.Zero;
         }
 
+        // 在系统已加载的布局中找某语言的"输入法"布局（HKL 高字 E0xx，如微软拼音/搜狗）。
+        // 优先返回真输入法；找不到时退回该语言任意布局（如中文美式键盘），
+        // 避免"中文锁定"落到纯键盘布局（打字恒为英文）导致切过去仍是英文
+        public static IntPtr FindImeLayoutByLanguage(int langId)
+        {
+            int count = (int)GetKeyboardLayoutList(0, null);
+            if (count <= 0) return IntPtr.Zero;
+            IntPtr[] hkls = new IntPtr[count];
+            GetKeyboardLayoutList(count, hkls);
+            IntPtr fallback = IntPtr.Zero;
+            foreach (IntPtr hkl in hkls)
+            {
+                if ((int)(hkl.ToInt64() & 0xFFFF) != langId) continue;
+                if (IsImeLayout(hkl)) return hkl;      // 真输入法优先
+                if (fallback == IntPtr.Zero) fallback = hkl;
+            }
+            return fallback;
+        }
+
         // 英文锁定状态变化日志：只在 (进程|布局|hIMC|开关|转换状态) 元组变化时记一条，
         // 用于定位"锁定无效但日志全空"的静默短路分支
         private static string _lastEngState;
