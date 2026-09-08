@@ -37,6 +37,42 @@ namespace InputMethodLock
         public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll")]
+        public static extern bool IsWindow(IntPtr hWnd);
+
+        // —— 跨进程 IME 状态读写 ——
+        // IMM32 的 ImmGetContext 对别的进程的窗口恒返回 0，但 WM_IME_CONTROL 是
+        // 发给窗口的消息、由目标进程侧的 IME 处理，因而可以跨进程读写中英模式。
+        public const uint WM_IME_CONTROL = 0x0283;
+        public const int IMC_GETCONVERSIONMODE = 0x0001;
+        public const int IMC_SETCONVERSIONMODE = 0x0002;
+        public const int IMC_GETOPENSTATUS = 0x0005;
+        public const int IMC_SETOPENSTATUS = 0x0006;
+        public const uint SMTO_ABORTIFHUNG = 0x0002;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam,
+            IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+
+        // 读 IME 状态子命令（IMC_GETxxx）；失败返回 -1
+        public static int QueryIme(IntPtr hwnd, int command)
+        {
+            IntPtr result;
+            IntPtr ret = SendMessageTimeout(hwnd, WM_IME_CONTROL, (IntPtr)command,
+                IntPtr.Zero, SMTO_ABORTIFHUNG, 300, out result);
+            if (ret == IntPtr.Zero) return -1;
+            return result.ToInt32();
+        }
+
+        // 写 IME 状态子命令（IMC_SETxxx）。约定：wParam=子命令，lParam=值
+        public static bool SetIme(IntPtr hwnd, int command, int value)
+        {
+            IntPtr result;
+            IntPtr ret = SendMessageTimeout(hwnd, WM_IME_CONTROL, (IntPtr)command,
+                (IntPtr)value, SMTO_ABORTIFHUNG, 300, out result);
+            return ret != IntPtr.Zero;
+        }
+
+        [DllImport("user32.dll")]
         public static extern bool DestroyIcon(IntPtr hIcon);
 
         [DllImport("imm32.dll")]
@@ -108,14 +144,17 @@ namespace InputMethodLock
             public ushort LangId;
             public Guid Clsid;
             public Guid GuidProfile;
+            public string Name;
+            public IntPtr Hkl;      // 切换时要投递的 HKL（TIP 自身 HKL 或 substitute 布局）
         }
 
-        // 从注册表枚举用户已启用的输入法：
+        // 从注册表枚举**全部**已启用的输入法，不限语言：
         // HKCU\Control Panel\International\User Profile\<语言tag> 下的值名形如
         // "0804:{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}{FA550B04-5AD7-411F-A5AC-CA038EC515D7}"
         // 这是"中文锁定"要激活微软拼音/搜狗等具体输入法的唯一信息来源——
         // 系统已加载布局里通常只有 08040804 这种 substitute layout，拿不到输入法本体。
-        public static TipInfo[] GetEnabledInputProcessors(ushort langId)
+        // 不按语言过滤：换一台装了日语/英语输入法的机器同样要能枚举。
+        public static TipInfo[] GetEnabledInputProcessors()
         {
             var list = new List<TipInfo>();
             try
@@ -132,8 +171,10 @@ namespace InputMethodLock
                             foreach (string name in k.GetValueNames())
                             {
                                 TipInfo t;
-                                if (TryParseTipName(name, langId, out t) && !list.Contains(t))
-                                    list.Add(t);
+                                if (!TryParseTipName(name, out t)) continue;
+                                t.Name = ResolveTipName(t);
+                                t.Hkl = ResolveTipHkl(t);
+                                if (!list.Contains(t)) list.Add(t);
                             }
                         }
                     }
@@ -147,7 +188,7 @@ namespace InputMethodLock
             return list.ToArray();
         }
 
-        private static bool TryParseTipName(string name, ushort langId, out TipInfo info)
+        private static bool TryParseTipName(string name, out TipInfo info)
         {
             info = new TipInfo();
             if (name == null || name.Length < 6 || name[4] != ':') return false;
@@ -155,7 +196,6 @@ namespace InputMethodLock
             if (!ushort.TryParse(name.Substring(0, 4),
                 System.Globalization.NumberStyles.HexNumber,
                 System.Globalization.CultureInfo.InvariantCulture, out l)) return false;
-            if (l != langId) return false;
 
             string rest = name.Substring(5);
             int split = rest.IndexOf('}');
@@ -167,6 +207,104 @@ namespace InputMethodLock
             info.LangId = l;
             info.Clsid = clsid;
             info.GuidProfile = guid;
+            return true;
+        }
+
+        // —— 输入法显示名 ——
+        // 优先 HKLM\SOFTWARE\Microsoft\CTF\TIP\<CLSID>\LanguageProfile\<langid>\<guid>\Description
+        // （多为 "@dll,-id" 形式的间接字符串，需 SHLoadIndirectString 解析），
+        // 再退回 CLSID 注册表默认名，最后退回 langid+CLSID 短串。
+        [DllImport("shcore.dll", CharSet = CharSet.Unicode)]
+        private static extern int SHLoadIndirectString(string pszSource,
+            System.Text.StringBuilder pszOutBuf, int cchOutBuf, IntPtr ppvReserved);
+
+        private static string ResolveTipName(TipInfo t)
+        {
+            string raw = null;
+            try
+            {
+                string path = string.Format(
+                    @"SOFTWARE\Microsoft\CTF\TIP\{{{0}}}\LanguageProfile\{1:X4}\{{{2}}}",
+                    t.Clsid, t.LangId, t.GuidProfile);
+                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(path))
+                {
+                    raw = k != null ? k.GetValue("Description") as string : null;
+                }
+                if (string.IsNullOrEmpty(raw))
+                {
+                    using (RegistryKey k2 = Registry.LocalMachine.OpenSubKey(
+                        @"SOFTWARE\Microsoft\CTF\TIP\{" + t.Clsid + "}"))
+                    {
+                        raw = k2 != null ? k2.GetValue("Description") as string : null;
+                    }
+                }
+            }
+            catch { }
+
+            if (!string.IsNullOrEmpty(raw))
+            {
+                if (raw[0] == '@')
+                {
+                    try
+                    {
+                        var sb = new System.Text.StringBuilder(260);
+                        if (SHLoadIndirectString(raw, sb, sb.Capacity, IntPtr.Zero) == 0
+                            && sb.Length > 0)
+                            return sb.ToString();
+                    }
+                    catch { }
+                }
+                else
+                {
+                    return raw;
+                }
+            }
+
+            string clsidName = null;
+            try
+            {
+                using (RegistryKey k = Registry.ClassesRoot.OpenSubKey(
+                    @"CLSID\{" + t.Clsid + @"}"))
+                {
+                    clsidName = k != null ? k.GetValue(null) as string : null;
+                }
+            }
+            catch { }
+            if (!string.IsNullOrEmpty(clsidName)) return clsidName;
+
+            return string.Format("输入法 {0:X4}:{1}", t.LangId,
+                t.Clsid.ToString().Substring(0, 8));
+        }
+
+        // 切换到该输入法时要投递的 HKL：
+        // 优先系统已加载布局中同语言的真输入法布局（高字 E0xx，如搜狗 E0810804）；
+        // 没有则退回该语言的默认键盘布局（微软拼音这类 substitute 到 08040804 的输入法走这条）
+        private static IntPtr ResolveTipHkl(TipInfo t)
+        {
+            foreach (IntPtr hkl in GetLayoutList())
+            {
+                long v = hkl.ToInt64();
+                if ((int)(v & 0xFFFF) != t.LangId) continue;
+                if (IsImeLayout(hkl)) return hkl;
+            }
+            IntPtr plain = new IntPtr(((long)t.LangId << 16) | (uint)t.LangId);
+            return plain;
+        }
+
+        // 输入法条目的配置存储格式：tip:<langid>:{CLSID}{GUID}
+        public static string TipToStorage(TipInfo t)
+        {
+            return string.Format("tip:{0:X4}:{{{1}}}{{{2}}}", t.LangId, t.Clsid, t.GuidProfile);
+        }
+
+        public static bool StorageToTip(string storage, out TipInfo tip)
+        {
+            tip = new TipInfo();
+            if (string.IsNullOrEmpty(storage) || !storage.StartsWith("tip:")) return false;
+            string rest = storage.Substring(4);
+            if (!TryParseTipName(rest, out tip)) return false;
+            tip.Name = ResolveTipName(tip);
+            tip.Hkl = ResolveTipHkl(tip);
             return true;
         }
 

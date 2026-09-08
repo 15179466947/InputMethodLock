@@ -13,7 +13,10 @@ namespace InputMethodLock
         public string TargetLayout = "00000409";        // 键盘布局 KLID，如 00000409 美式英文
         public string HotkeyModifiers = "Control";      // None|Alt|Control|Shift 组合（+ 号分隔）
         public string HotkeyKey = "Oemtilde";           // Keys 枚举名，None=不启用热键
-        public string UnlockLayout = "auto";            // auto=解锁恢复快照 | none=不切换 | hkl:XXXXXXXX=指定
+        // auto=解锁恢复快照 | none=不切换 | hkl:XXXXXXXX=键盘布局 | tip:0804:{CLSID}{GUID}=输入法
+        public string UnlockLayout = "auto";
+        // 中文锁定要切到的输入法，格式同 UnlockLayout；空=自动取已启用列表第一个
+        public string ChineseIme = "";
         public List<string> Exceptions = new List<string>(); // 例外进程名（不锁定）
         public bool StartWithWindows = false;
 
@@ -58,9 +61,10 @@ namespace InputMethodLock
                         case "HotkeyModifiers": cfg.HotkeyModifiers = val; break;
                         case "HotkeyKey": cfg.HotkeyKey = val; break;
                         case "UnlockLayout":
-                            // v0.10 起默认 auto（恢复快照）；旧配置的 none 是默认值而非用户选择，一并升级
-                            cfg.UnlockLayout = string.IsNullOrEmpty(val) || val == "none" ? "auto" : val;
+                            // 缺省（旧配置文件无此行）回退默认 auto；明确选 none 时保留，使其真正生效
+                            cfg.UnlockLayout = string.IsNullOrEmpty(val) ? "auto" : val;
                             break;
+                        case "ChineseIme": cfg.ChineseIme = val; break;
                         case "Exceptions": cfg.Exceptions = ParseList(val); break;
                         case "StartWithWindows": cfg.StartWithWindows = val == "true"; break;
                     }
@@ -82,6 +86,7 @@ namespace InputMethodLock
                 sb.AppendLine("HotkeyModifiers=" + HotkeyModifiers);
                 sb.AppendLine("HotkeyKey=" + HotkeyKey);
                 sb.AppendLine("UnlockLayout=" + UnlockLayout);
+                sb.AppendLine("ChineseIme=" + ChineseIme);
                 sb.AppendLine("Exceptions=" + JoinList(Exceptions));
                 sb.AppendLine("StartWithWindows=" + (StartWithWindows ? "true" : "false"));
                 File.WriteAllText(GetConfigPath(), sb.ToString(), Encoding.UTF8);

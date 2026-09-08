@@ -20,6 +20,10 @@ namespace InputMethodLock
         private IntPtr _chineseHkl = IntPtr.Zero; // 中文锁定时，前台无 IME 上下文的兜底布局
         private HashSet<string> _exceptions = new HashSet<string>();
         private bool _lastLockedState;
+        private IntPtr _lastLockedHwnd; // 最近一次执行锁定的前台窗口（停用恢复用）
+
+        // 停用锁定后要把输入法切回去的目标窗口（托盘/资源管理器不是用户真正在用的窗口）
+        public IntPtr LastLockedHwnd { get { return _lastLockedHwnd; } }
 
         public bool Enabled { get; set; }
         public bool IsLockedNow { get { return _lastLockedState; } }
@@ -86,6 +90,10 @@ namespace InputMethodLock
                 return;
             }
 
+            // 记住用户实际在用的窗口：停用锁定时要向**这个**窗口发恢复消息。
+            // 直接取当时的前台窗口会拿到托盘/资源管理器，恢复就发错了地方。
+            _lastLockedHwnd = hwnd;
+
             bool ok;
             if (_mode == LockMode.Layout)
             {
@@ -113,41 +121,71 @@ namespace InputMethodLock
         }
 
         // —— 中文锁定 ——
-        // 能做的：确保中文输入法（微软拼音/搜狗等）处于激活状态，从英文键盘切回中文。
-        // 做不到的：跨进程读不到输入法自身的"中/英模式"——实测
-        // GetActiveLanguageProfile 对已启用的输入法恒返回 S_OK（与当前模式无关），
-        // ImmGetContext 跨进程恒为 0。所以中文输入法激活后，其中英切换仍归用户控制。
-        private const int ChineseLangId = 0x0804;
+        // 能做的：确保目标输入法（微软拼音/搜狗等）处于激活状态，从别的语言切回来。
+        // 做不到的：跨进程读不到输入法自身的"中/英模式"（实测 WM_IME_CONTROL 读回恒为 0、
+        // GetActiveLanguageProfile 对已启用输入法恒返回 S_OK），所以输入法激活后
+        // 是中文还是英文模式，仍由用户/输入法自行维持。
+        private ImeApi.TipInfo _chineseTip;
+        private bool _chineseTipValid;
         private string _chnLogSig;
+
+        // 中文锁定的目标输入法（设置界面指定；未指定时自动取已启用列表的第一个，
+        // 这样换一台装了别的输入法的机器也能直接用）
+        internal void SetChineseTarget(ImeApi.TipInfo tip, bool valid)
+        {
+            _chineseTip = tip;
+            _chineseTipValid = valid;
+        }
 
         private bool ForceChinese(IntPtr hwnd)
         {
             uint tid = ImeApi.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
             IntPtr current = ImeApi.GetKeyboardLayout(tid);
-            if ((int)(current.ToInt64() & 0xFFFF) == ChineseLangId)
-                return true; // 已是中文语言（中文输入法或中文键盘）
 
-            // 精确激活用户已启用的中文输入法（注册表枚举 + 旧 TSF 接口，本机可用）
-            bool activated = TsfProfiles.ActivateChineseIme(
-                ImeApi.GetEnabledInputProcessors(ChineseLangId));
+            ImeApi.TipInfo tip = _chineseTip;
+            bool valid = _chineseTipValid;
+            if (!valid)
+            {
+                ImeApi.TipInfo[] all = ImeApi.GetEnabledInputProcessors();
+                if (all.Length > 0) { tip = all[0]; valid = true; }
+            }
 
-            // 兜底：切到中文键盘布局（拿不到输入法时至少把语言切回中文）
-            if (!activated && _chineseHkl != IntPtr.Zero)
-                ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, _chineseHkl);
+            IntPtr target = valid ? tip.Hkl : _chineseHkl;
+            if (target == IntPtr.Zero)
+            {
+                LogChn(hwnd, current, IntPtr.Zero, false);
+                return false;
+            }
 
-            LogChn(hwnd, current, activated);
+            // 判据：目标有独立 IME 布局（搜狗等，HKL 高字 E0xx）时按完整 HKL 精确比较；
+            // 否则（微软拼音这类 substitute 到 08040804 的）按语言比较，避免同语言内抖动
+            long cur = current.ToInt64();
+            bool locked = ImeApi.IsImeLayout(target)
+                ? cur == target.ToInt64()
+                : (int)(cur & 0xFFFF) == (valid ? tip.LangId : (int)(target.ToInt64() & 0xFFFF));
+            if (locked) return true;
+
+            // 关键：ActivateLanguageProfile 实测返回 S_OK 却并不切换前台输入法
+            // （它只作用于调用线程），所以不管它成败，消息通道都必须发——
+            // 真正生效的是这一步。早期版本"激活成功就跳过兜底"导致中文锁定失效。
+            if (valid) TsfProfiles.ActivateTip(tip.LangId, tip.Clsid, tip.GuidProfile);
+            ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, target);
+
+            LogChn(hwnd, current, target, valid);
             return false; // 异步生效，下个周期复查
         }
 
-        private void LogChn(IntPtr hwnd, IntPtr current, bool activated)
+        private void LogChn(IntPtr hwnd, IntPtr current, IntPtr target, bool tipMode)
         {
-            string sig = current.ToInt64().ToString("X8") + "|" + activated;
+            string sig = current.ToInt64().ToString("X8") + "|"
+                + target.ToInt64().ToString("X8") + "|" + tipMode;
             if (sig == _chnLogSig) return;
             _chnLogSig = sig;
-            Logger.Log("ChineseLock: proc={0} current={1:X8} activate-tip={2} fallback={3:X8}",
-                ImeApi.GetForegroundProcessName(hwnd) ?? "-", current.ToInt64(), activated,
-                _chineseHkl.ToInt64());
+            Logger.Log("ChineseLock: proc={0} current={1:X8} -> target={2:X8} (tip={3})",
+                ImeApi.GetForegroundProcessName(hwnd) ?? "-",
+                current.ToInt64(), target.ToInt64(), tipMode);
         }
+
         // 真机实测结论（Win10 19045，本机）：
         //  · TSF 新接口 ITfInputProcessorProfileMgr 所有方法恒返回 E_INVALIDARG，不可用
         //  · ImmGetContext 跨进程恒返回 0 —— IMM32 只对自身进程的窗口有效

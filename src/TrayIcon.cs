@@ -214,11 +214,28 @@ namespace InputMethodLock
             else if (_config.Mode == "chinese") _locker.SetMode(LockMode.Chinese);
             else _locker.SetMode(LockMode.English);
             _locker.SetTargetLayout(ParseLayoutStorage(_config.TargetLayout));
-            // 系统里的简体中文输入法，供"中文锁定"在英文键盘上切换
-            IntPtr chinese = ImeApi.FindImeLayoutByLanguage(0x0804);
+
+            // 中文锁定目标：设置指定了 tip: 就解析它，否则交给 ImeLocker 退回到
+            // 第一个已启用输入法（换机器也能用，不写死语言）。兜底布局语言也据此取。
+            ushort fallbackLang = 0x0804;
+            ImeApi.TipInfo tip;
+            if (!string.IsNullOrEmpty(_config.ChineseIme)
+                && ImeApi.StorageToTip(_config.ChineseIme, out tip))
+            {
+                _locker.SetChineseTarget(tip, true);
+                fallbackLang = tip.LangId;
+            }
+            else
+            {
+                ImeApi.TipInfo[] all = ImeApi.GetEnabledInputProcessors();
+                if (all.Length > 0) fallbackLang = all[0].LangId;
+                _locker.SetChineseTarget(default(ImeApi.TipInfo), false);
+            }
+            IntPtr chinese = ImeApi.FindImeLayoutByLanguage(fallbackLang);
             if (chinese == IntPtr.Zero)
-                chinese = ImeApi.LoadKeyboardLayout("00000804", 0x00000001 /*KLF_ACTIVATE*/);
+                chinese = ImeApi.LoadKeyboardLayout(fallbackLang.ToString("X8"), 0x00000001 /*KLF_ACTIVATE*/);
             _locker.SetChineseFallbackLayout(chinese);
+
             _locker.SetExceptions(_config.Exceptions);
         }
 
@@ -308,20 +325,37 @@ namespace InputMethodLock
 
         // 停用锁定时切换输入法：auto=恢复锁定前的快照；none=不动；hkl:xx=指定输入法。
         // 通道统一走 WM_INPUTLANGCHANGEREQUEST（实测可靠的跨进程切换方式）
+        // 解析"停用恢复"的目标 HKL：auto=恢复快照（由调用方处理）；none=不切换（Zero）；
+        // tip:xxx=指定输入法的 HKL；其余当键盘布局解析。
+        private IntPtr ResolveRestoreHkl(string val)
+        {
+            if (val == "none") return IntPtr.Zero;
+            if (val.StartsWith("tip:"))
+            {
+                ImeApi.TipInfo tip;
+                if (ImeApi.StorageToTip(val, out tip) && tip.Hkl != IntPtr.Zero) return tip.Hkl;
+                return IntPtr.Zero;
+            }
+            return ParseLayoutStorage(val);
+        }
+
         private void RestoreUnlockLayout()
         {
             string val = string.IsNullOrEmpty(_config.UnlockLayout) ? "auto" : _config.UnlockLayout;
             if (val == "none") return;
 
-            IntPtr hkl = val == "auto" ? _userHklSnapshot : ParseLayoutStorage(val);
+            IntPtr hkl = val == "auto" ? _userHklSnapshot : ResolveRestoreHkl(val);
             if (hkl == IntPtr.Zero) return;
 
-            IntPtr hwnd = ImeApi.GetForegroundWindow();
+            // 发给用户真正在用的窗口：停用时当前前台可能是托盘/资源管理器，
+            // 发过去恢复就无效。LastLockedHwnd 是锁定期间最后强制过的前台窗口。
+            IntPtr hwnd = _locker.LastLockedHwnd;
+            if (hwnd == IntPtr.Zero || !ImeApi.IsWindow(hwnd)) hwnd = ImeApi.GetForegroundWindow();
             if (hwnd == IntPtr.Zero) return;
             bool posted = ImeApi.PostMessage(hwnd, ImeApi.WM_INPUTLANGCHANGEREQUEST,
                 IntPtr.Zero, hkl);
-            Logger.Log("Unlock: restore layout {0} posted={1}",
-                hkl.ToInt64().ToString("X8"), posted);
+            Logger.Log("Unlock: restore layout {0} posted={1} hwnd={2}",
+                hkl.ToInt64().ToString("X8"), posted, hwnd.ToInt64().ToString("X"));
         }
 
         // 刷新托盘图标、菜单勾选、提示文字与已打开的设置窗口

@@ -31,11 +31,11 @@ namespace InputMethodLock
                     ks[i] = Hex(ImeApi.GetLayoutList()[i]);
                 Log(sb, "已加载布局=" + string.Join(",", ks));
 
-                ImeApi.TipInfo[] tips = ImeApi.GetEnabledInputProcessors(0x0804);
-                Log(sb, "已启用中文输入法=" + tips.Length + " 个");
+                ImeApi.TipInfo[] tips = ImeApi.GetEnabledInputProcessors();
+                Log(sb, "已启用输入法=" + tips.Length + " 个");
                 foreach (ImeApi.TipInfo t in tips)
                     Log(sb, "   " + t.LangId.ToString("X4") + " " + t.Clsid.ToString("B")
-                        + " " + t.GuidProfile.ToString("B"));
+                        + " " + t.GuidProfile.ToString("B") + " " + t.Name);
 
                 // —— 通道探测 ——
                 TsfProfile p;
@@ -52,6 +52,34 @@ namespace InputMethodLock
                 IntPtr hIMC = ImeApi.ImmGetContext(hwnd);
                 Log(sb, "ImmGetContext(跨进程)=" + Hex(hIMC));
                 if (hIMC != IntPtr.Zero) ImeApi.ImmReleaseContext(hwnd, hIMC);
+
+                // —— WM_IME_CONTROL：跨进程读写中英模式 ——
+                // 这是"保留当前输入法、只锁中英状态"能否实现的技术前提：
+                // IMM32 的 ImmGetContext 跨进程恒为 0，但 WM_IME_CONTROL 是窗口消息，
+                // 由目标进程侧的 IME 处理，理论上可以跨进程读写。
+                Log(sb, "--- IME 模式通道 (WM_IME_CONTROL) ---");
+                ImeApi.PostMessage(ImeApi.GetForegroundWindow(),
+                    ImeApi.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, new IntPtr(0x08040804));
+                Thread.Sleep(500);
+                IntPtr h = ImeApi.GetForegroundWindow();
+                Log(sb, "切到中文布局 HKL=" + Hex(CurrentHkl())
+                    + " proc=" + (ImeApi.GetForegroundProcessName(h) ?? "-"));
+                int open = ImeApi.QueryIme(h, ImeApi.IMC_GETOPENSTATUS);
+                int mode = ImeApi.QueryIme(h, ImeApi.IMC_GETCONVERSIONMODE);
+                Log(sb, "GETOPENSTATUS=" + open + " GETCONVERSIONMODE=" + mode
+                    + "  (1=中文 / 0=英文 / -1=通道不可用)");
+
+                bool setEn = ImeApi.SetIme(h, ImeApi.IMC_SETCONVERSIONMODE,
+                    ImeApi.IME_CMODE_ALPHANUMERIC);
+                Thread.Sleep(300);
+                Log(sb, "设为英文 -> " + setEn
+                    + "，读回 mode=" + ImeApi.QueryIme(h, ImeApi.IMC_GETCONVERSIONMODE));
+
+                bool setCn = ImeApi.SetIme(h, ImeApi.IMC_SETCONVERSIONMODE,
+                    ImeApi.IME_CMODE_NATIVE);
+                Thread.Sleep(300);
+                Log(sb, "设为中文 -> " + setCn
+                    + "，读回 mode=" + ImeApi.QueryIme(h, ImeApi.IMC_GETCONVERSIONMODE));
 
                 // —— 英文锁定闭环 ——
                 Log(sb, "--- 英文锁定 ---");
@@ -81,6 +109,8 @@ namespace InputMethodLock
 
                 ImeLocker cn = new ImeLocker();
                 cn.SetMode(LockMode.Chinese);
+                if (tips.Length > 0) cn.SetChineseTarget(tips[0], true);
+                else cn.SetChineseTarget(default(ImeApi.TipInfo), false);
                 cn.SetChineseFallbackLayout(new IntPtr(0x08040804));
                 cn.Enabled = true;
                 cn.Enforce();
